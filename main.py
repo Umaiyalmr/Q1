@@ -83,9 +83,12 @@ async def observe_requests(request, call_next):
 
 
 @app.get("/work")
-def do_work(k: int = Query(..., ge=0, le=100000)):
-    result = sum(range(k))
-    return {"email": EMAIL, "done": k}
+def do_work(n: int = Query(..., ge=0, le=100000)):
+    result = sum(range(n))
+    return {
+        "email": EMAIL,
+        "done": n,
+    }
 
 
 @app.get("/metrics")
