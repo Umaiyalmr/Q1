@@ -12,7 +12,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
-EMAIL = os.environ.get("CHALLENGE_EMAIL", "your-email@example.com")
+EMAIL = "23f2005531@ds.study.iitm.ac.in"
 START_TIME = time.monotonic()
 MAX_LOG_ENTRIES = 1000
 
