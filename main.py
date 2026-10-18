@@ -1,6 +1,7 @@
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from collections import defaultdict, deque
 from threading import Lock
@@ -11,32 +12,14 @@ import json
 
 app = FastAPI(title="Orders API")
 
-# Allow the assignment page to call the API directly from a browser.
-app = CORSMiddleware(
-    app=app,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Retry-After"],
-)
-
 TOTAL_ORDERS = 58
 RATE_LIMIT = 15
 WINDOW_SECONDS = 10
 
 lock = Lock()
-
-# Fixed catalog: IDs 1 through 58, with no gaps.
 catalog = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
-
-# Idempotency-Key -> original order response.
 idempotency_store = {}
-
-# Newly created orders get IDs starting after the fixed catalog.
 next_order_id = TOTAL_ORDERS + 1
-
-# Client ID -> timestamps of requests in the sliding window.
 request_times = defaultdict(deque)
 
 
@@ -51,7 +34,6 @@ def check_rate_limit(client_id: str):
     with lock:
         timestamps = request_times[client_id]
 
-        # Remove requests outside the 10-second sliding window.
         while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
             timestamps.popleft()
 
@@ -71,19 +53,15 @@ def check_rate_limit(client_id: str):
 
 @app.middleware("http")
 async def client_rate_limit(request: Request, call_next):
-    # Preflight requests must be allowed without consuming quota.
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Rate-limit API requests independently for each client.
-    if request.url.path in ("/orders",):
+    if request.url.path == "/orders":
         client_id = request.headers.get("X-Client-Id", "anonymous")
 
         try:
             check_rate_limit(client_id)
         except HTTPException as exc:
-            from fastapi.responses import JSONResponse
-
             return JSONResponse(
                 status_code=exc.status_code,
                 content={"detail": exc.detail},
@@ -101,7 +79,6 @@ def create_order(
     global next_order_id
 
     with lock:
-        # Return the original result for a repeated key.
         if idempotency_key in idempotency_store:
             return idempotency_store[idempotency_key]
 
@@ -113,7 +90,6 @@ def create_order(
 
         next_order_id += 1
         idempotency_store[idempotency_key] = result
-
         return result
 
 
@@ -132,8 +108,7 @@ def decode_cursor(cursor: str) -> int:
         if (
             isinstance(last_id, bool)
             or not isinstance(last_id, int)
-            or last_id < 0
-            or last_id > TOTAL_ORDERS
+            or not 0 <= last_id <= TOTAL_ORDERS
         ):
             raise ValueError("Invalid cursor")
 
@@ -148,13 +123,9 @@ def list_orders(
     cursor: str | None = Query(default=None),
 ):
     last_id = decode_cursor(cursor) if cursor else 0
+    end = min(last_id + limit, TOTAL_ORDERS)
 
-    # IDs are sequential, so the cursor is the last ID already returned.
-    start = last_id
-    end = min(start + limit, TOTAL_ORDERS)
-
-    items = catalog[start:end]
-
+    items = catalog[last_id:end]
     next_cursor = encode_cursor(end) if end < TOTAL_ORDERS else None
 
     return {
@@ -166,3 +137,15 @@ def list_orders(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# IMPORTANT: Wrap the completed FastAPI app only after defining
+# all routes and middleware. This makes CORS outermost.
+app = CORSMiddleware(
+    app=app,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+)
