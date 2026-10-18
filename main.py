@@ -12,8 +12,8 @@ import json
 app = FastAPI(title="Orders API")
 
 # Allow the assignment page to call the API directly from a browser.
-app.add_middleware(
-    CORSMiddleware,
+app = CORSMiddleware(
+    app=app,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
