@@ -75,13 +75,18 @@ async def ping():
     }
 
 
-# Middleware 3: CORS must wrap the entire app, including error responses.
-# Keep this at the bottom, after routes and middleware definitions.
+
+# Keep this at the very bottom of main.py.
+# Add the actual origin of the exam page if it differs.
 app = CORSMiddleware(
     app=app,
-    allow_origins=[ALLOWED_ORIGIN],
+    allow_origins=[
+        "https://app-m7lh9.example.com",
+        # Add the exact origin shown in your browser's address bar.
+    ],
     allow_credentials=False,
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["X-Request-ID", "X-Client-Id", "Content-Type"],
     expose_headers=["X-Request-ID", "Retry-After"],
 )
+
