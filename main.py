@@ -78,15 +78,13 @@ async def ping():
 
 # Keep this at the very bottom of main.py.
 # Add the actual origin of the exam page if it differs.
+
 app = CORSMiddleware(
     app=app,
-    allow_origins=[
-        "https://app-m7lh9.example.com",
-        # Add the exact origin shown in your browser's address bar.
-    ],
+    allow_origins=["https://app-m7ulh9.example.com"],
     allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["X-Request-ID", "X-Client-Id", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
     expose_headers=["X-Request-ID", "Retry-After"],
 )
 
