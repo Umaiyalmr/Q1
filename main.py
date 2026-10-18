@@ -1,80 +1,88 @@
-import os
+
 import time
 import uuid
 from statistics import mean
 
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import jwt
+from jwt.exceptions import InvalidTokenError
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-ALLOWED_ORIGIN = "https://dash-2cjzj36.example.com"
-EMAIL = os.environ["CHALLENGE_EMAIL"]
+ISSUER = "https://idp.exam.local"
+AUDIENCE = "tds-dzkopdin.apps.exam.local"
 
-api = FastAPI()
+PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2ok0HspNjgA+2rTLbeuY
+cxiP/hG8C6Sh9iw3yiLAA4HCnpIITcbWCSelbvYGuC3EbNy4xFy+5Cbj5DHJMID
+EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNWheKuzsPUNVldu6A9cNteNpXc
+WyJjG2axVfmq7i6SukrJ1oWYG7XTtAVkPujSI4OTsQfO3h5NepzdfXpr28oNnzfW
+ed+zcRl6BcnNNo/WvFJ4xyCLSf0BCOgDtGW6PdaChd119VDetJZVEgC5tkyVxSfI
+SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LLgniT7G1kL9Mce3b0wGLs9/7ZIX
+dQIDAQAB
+-----END PUBLIC KEY-----"""
+
+app = FastAPI()
 
 
-@api.get("/stats")
-def get_stats(values: str = Query(...)):
+@app.middleware("http")
+async def add_required_headers(request: Request, call_next):
+    start = time.perf_counter()
+    request_id = str(uuid.uuid4())
+
     try:
-        parts = values.split(",")
-        if any(not p.strip() for p in parts):
-            raise ValueError
-        nums = [int(p.strip()) for p in parts]
-        if not nums:
-            raise ValueError
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="values must be comma-separated integers",
+        response = await call_next(request)
+    except Exception:
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
         )
 
-    return {
-        "email": EMAIL,
-        "count": len(nums),
-        "sum": sum(nums),
-        "min": min(nums),
-        "max": max(nums),
-        "mean": mean(nums),
-    }
+    elapsed = max(0.0, time.perf_counter() - start)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = f"{elapsed:.6f}"
+    return response
 
 
-# Wrap the entire FastAPI application in CORS middleware.
-cors_app = CORSMiddleware(
-    app=api,
-    allow_origins=[ALLOWED_ORIGIN],
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-    allow_credentials=False,
-)
+@app.post("/verify")
+async def verify_token(request: Request):
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Invalid request body")
 
+        token = body.get("token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("Missing token")
 
-# Outer middleware adds headers even when CORS handles OPTIONS directly.
-class RequiredHeadersMiddleware:
-    def __init__(self, app):
-        self.app = app
+        claims = jwt.decode(
+            token,
+            PUBLIC_KEY,
+            algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            options={
+                "require": ["exp", "iss", "aud", "sub", "email"],
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_iss": True,
+                "verify_aud": True,
+            },
+        )
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
+        return {
+            "valid": True,
+            "email": claims["email"],
+            "sub": claims["sub"],
+            "aud": claims["aud"],
+        }
 
-        started = time.perf_counter()
-        request_id = str(uuid.uuid4())
-
-        async def send_with_headers(message):
-            if message["type"] == "http.response.start":
-                headers = list(message.get("headers", []))
-                headers.extend([
-                    (b"x-request-id", request_id.encode()),
-                    (
-                        b"x-process-time",
-                        f"{max(0.0, time.perf_counter() - started):.6f}".encode(),
-                    ),
-                ])
-                message = {**message, "headers": headers}
-
-            await send(message)
-
-        await self.app(scope, receive, send_with_headers)
-
-
-app = RequiredHeadersMiddleware(cors_app)
+    except (InvalidTokenError, ValueError, TypeError, KeyError):
+        return JSONResponse(
+            status_code=401,
+            content={"valid": False},
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content={"valid": False},
+        )
