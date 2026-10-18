@@ -1,115 +1,168 @@
 
-import json
-import logging
-import os
-import time
-import uuid
-from collections import deque
-from datetime import datetime, timezone
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from collections import defaultdict, deque
 from threading import Lock
+from time import monotonic
+from math import ceil
+import base64
+import json
 
-from fastapi import FastAPI, Query
-from fastapi.responses import PlainTextResponse
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+app = FastAPI(title="Orders API")
 
-EMAIL = "23f2005531@ds.study.iitm.ac.in"
-START_TIME = time.monotonic()
-MAX_LOG_ENTRIES = 1000
-
-app = FastAPI()
-
-REQUEST_COUNTER = Counter(
-    "http_requests_total",
-    "Total number of HTTP requests received",
+# Allow the assignment page to call the API directly from a browser.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
-recent_logs = deque(maxlen=MAX_LOG_ENTRIES)
-logs_lock = Lock()
+TOTAL_ORDERS = 58
+RATE_LIMIT = 15
+WINDOW_SECONDS = 10
 
-logger = logging.getLogger("service")
-logger.setLevel(logging.INFO)
-logger.propagate = False
+lock = Lock()
 
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(handler)
+# Fixed catalog: IDs 1 through 58, with no gaps.
+catalog = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
+
+# Idempotency-Key -> original order response.
+idempotency_store = {}
+
+# Newly created orders get IDs starting after the fixed catalog.
+next_order_id = TOTAL_ORDERS + 1
+
+# Client ID -> timestamps of requests in the sliding window.
+request_times = defaultdict(deque)
 
 
-def write_log(level: str, timestamp: str, path: str, request_id: str):
-    entry = {
-        "level": level,
-        "ts": timestamp,
-        "path": path,
-        "request_id": request_id,
-    }
+class OrderRequest(BaseModel):
+    item: str = "default"
+    quantity: int = 1
 
-    with logs_lock:
-        recent_logs.append(entry)
 
-    logger.log(
-        logging.ERROR if level == "error" else logging.INFO,
-        json.dumps(entry, separators=(",", ":")),
-    )
+def check_rate_limit(client_id: str):
+    now = monotonic()
+
+    with lock:
+        timestamps = request_times[client_id]
+
+        # Remove requests outside the 10-second sliding window.
+        while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
+            timestamps.popleft()
+
+        if len(timestamps) >= RATE_LIMIT:
+            retry_after = max(
+                1,
+                ceil(WINDOW_SECONDS - (now - timestamps[0]))
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        timestamps.append(now)
 
 
 @app.middleware("http")
-async def observe_requests(request, call_next):
-    started = time.perf_counter()
-    REQUEST_COUNTER.inc()
+async def client_rate_limit(request: Request, call_next):
+    # Preflight requests must be allowed without consuming quota.
+    if request.method == "OPTIONS":
+        return await call_next(request)
 
-    request_id = str(uuid.uuid4())
-    timestamp = datetime.now(timezone.utc).isoformat()
+    # Rate-limit API requests independently for each client.
+    if request.url.path in ("/orders",):
+        client_id = request.headers.get("X-Client-Id", "anonymous")
 
+        try:
+            check_rate_limit(client_id)
+        except HTTPException as exc:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
+
+    return await call_next(request)
+
+
+@app.post("/orders", status_code=201)
+def create_order(
+    order: OrderRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    global next_order_id
+
+    with lock:
+        # Return the original result for a repeated key.
+        if idempotency_key in idempotency_store:
+            return idempotency_store[idempotency_key]
+
+        result = {
+            "id": next_order_id,
+            "item": order.item,
+            "quantity": order.quantity,
+        }
+
+        next_order_id += 1
+        idempotency_store[idempotency_key] = result
+
+        return result
+
+
+def encode_cursor(last_id: int) -> str:
+    raw = json.dumps({"last_id": last_id}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str) -> int:
     try:
-        response = await call_next(request)
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded).decode()
+        payload = json.loads(raw)
+        last_id = payload["last_id"]
+
+        if (
+            isinstance(last_id, bool)
+            or not isinstance(last_id, int)
+            or last_id < 0
+            or last_id > TOTAL_ORDERS
+        ):
+            raise ValueError("Invalid cursor")
+
+        return last_id
     except Exception:
-        write_log("error", timestamp, request.url.path, request_id)
-        raise
-
-    elapsed = max(0.0, time.perf_counter() - started)
-
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Process-Time"] = f"{elapsed:.6f}"
-
-    write_log(
-        "info" if response.status_code < 500 else "error",
-        timestamp,
-        request.url.path,
-        request_id,
-    )
-
-    return response
+        raise HTTPException(status_code=400, detail="Invalid cursor")
 
 
-@app.get("/work")
-def do_work(n: int = Query(..., ge=0, le=100000)):
-    result = sum(range(n))
+@app.get("/orders")
+def list_orders(
+    limit: int = Query(default=10, ge=1),
+    cursor: str | None = Query(default=None),
+):
+    last_id = decode_cursor(cursor) if cursor else 0
+
+    # IDs are sequential, so the cursor is the last ID already returned.
+    start = last_id
+    end = min(start + limit, TOTAL_ORDERS)
+
+    items = catalog[start:end]
+
+    next_cursor = encode_cursor(end) if end < TOTAL_ORDERS else None
+
     return {
-        "email": EMAIL,
-        "done": n,
+        "items": items,
+        "next_cursor": next_cursor,
     }
 
 
-@app.get("/metrics")
-def metrics():
-    return PlainTextResponse(
-        generate_latest().decode("utf-8"),
-        media_type=CONTENT_TYPE_LATEST,
-    )
-
-
-@app.get("/healthz")
+@app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "uptime_s": max(0.0, time.monotonic() - START_TIME),
-    }
-
-
-@app.get("/logs/tail")
-def logs_tail(limit: int = Query(100, ge=1, le=1000)):
-    with logs_lock:
-        entries = list(recent_logs)[-limit:]
-
-    return entries
+    return {"status": "ok"}
